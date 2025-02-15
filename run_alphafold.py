@@ -212,10 +212,8 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
 )
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
-    0,
-    'Optional override for the GPU device to use for inference. Defaults to the'
-    ' 1st GPU on the system. Useful on multi-GPU systems to pin each run to a'
-    ' specific GPU.',
+    None,  # 改为None默认值
+    'Deprecated: GPU device selection is not supported in CPU-only mode.',
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
@@ -322,6 +320,50 @@ class ModelRunner:
         jax.jit(forward_fn.apply, device=self._device), self.model_params
     )
 
+  @staticmethod
+  def fix_numerics(value, key=""):
+    """修复数值问题的通用方法"""
+    if isinstance(value, (np.ndarray, jnp.ndarray)):
+      if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+        print(f"Warning: Found NaN/inf in output {key}")
+        print(f"Shape: {value.shape}")
+        print(f"NaN count: {np.isnan(value).sum()}")
+        print(f"Inf count: {np.isinf(value).sum()}")
+        
+        # 对于坐标相关的键，使用更保守的替换值
+        if any(coord in key.lower() for coord in ['coord', 'pos', 'xyz', 'position']):
+          # 使用邻近的有效值填充
+          mask = np.isnan(value) | np.isinf(value)
+          if mask.any():
+            valid_values = value[~mask]
+            if len(valid_values) > 0:
+              # 使用有效值的平均值
+              fill_value = np.mean(valid_values)
+            else:
+              # 如果没有有效值，使用0
+              fill_value = 0.0
+            value = np.where(mask, fill_value, value)
+        else:
+          # 对于其他值使用标准替换
+          value = np.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+      
+      # 确保数值在合理范围内
+      value = np.clip(value, -1e6, 1e6)
+    return value
+
+  def check_output_numerics(self, result):
+    """检查并修复输出中的数值问题"""
+    def process_dict(d, parent_key=""):
+      for key, value in d.items():
+        full_key = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+          d[key] = process_dict(value, full_key)
+        else:
+          d[key] = self.fix_numerics(value, full_key)
+      return d
+
+    return process_dict(result)
+
   def run_inference(
       self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
   ) -> model.ModelResult:
@@ -334,6 +376,7 @@ class ModelRunner:
     )
 
     result = self._model(rng_key, featurised_example)
+    result = self.check_output_numerics(result)
     result = jax.tree.map(np.asarray, result)
     result = jax.tree.map(
         lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
@@ -342,29 +385,42 @@ class ModelRunner:
     result = dict(result)
     identifier = self.model_params['__meta__']['__identifier__'].tobytes()
     result['__identifier__'] = identifier
+    
+    # 最后再次检查关键坐标数据
+    if 'structure_module' in result:
+        for key in ['final_atom_positions', 'final_atom_mask']:
+            if key in result['structure_module']:
+                result['structure_module'][key] = self.fix_numerics(
+                    result['structure_module'][key], 
+                    f'structure_module.{key}'
+                )
+    
     return result
 
-  def extract_inference_results_and_maybe_embeddings(
+  def extract_structures(
       self,
       batch: features.BatchDict,
       result: model.ModelResult,
       target_name: str,
-  ) -> tuple[list[model.InferenceResult], dict[str, np.ndarray] | None]:
-    """Extracts inference results and embeddings (if set) from model outputs."""
-    inference_results = list(
+  ) -> list[model.InferenceResult]:
+    """Generates structures from model outputs."""
+    return list(
         model.Model.get_inference_result(
             batch=batch, result=result, target_name=target_name
         )
     )
-    num_tokens = len(inference_results[0].metadata['token_chain_ids'])
+
+  def extract_embeddings(
+      self,
+      result: model.ModelResult,
+  ) -> dict[str, np.ndarray] | None:
+    """Extracts embeddings from model outputs."""
     embeddings = {}
     if 'single_embeddings' in result:
-      embeddings['single_embeddings'] = result['single_embeddings'][:num_tokens]
+      embeddings['single_embeddings'] = result['single_embeddings']
     if 'pair_embeddings' in result:
-      embeddings['pair_embeddings'] = result['pair_embeddings'][
-          :num_tokens, :num_tokens
-      ]
-    return inference_results, embeddings or None
+      embeddings['pair_embeddings'] = result['pair_embeddings']
+    return embeddings or None
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
@@ -422,17 +478,17 @@ def predict_structure(
         f'Running model inference with seed {seed} took'
         f' {time.time() - inference_start_time:.2f} seconds.'
     )
-    print(f'Extracting inference results with seed {seed}...')
+    print(f'Extracting output structure samples with seed {seed}...')
     extract_structures = time.time()
-    inference_results, embeddings = (
-        model_runner.extract_inference_results_and_maybe_embeddings(
-            batch=example, result=result, target_name=fold_input.name
-        )
+    inference_results = model_runner.extract_structures(
+        batch=example, result=result, target_name=fold_input.name
     )
     print(
-        f'Extracting {len(inference_results)} inference samples with'
+        f'Extracting {len(inference_results)} output structure samples with'
         f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
     )
+
+    embeddings = model_runner.extract_embeddings(result)
 
     all_inference_results.append(
         ResultsForSeed(
@@ -582,6 +638,7 @@ def process_fold_input(
   Raises:
     ValueError: If the fold input has no chains.
   """
+  job_start_time = time.time()
   print(f'\nRunning fold job {fold_input.name}...')
 
   if not fold_input.chains:
@@ -601,35 +658,54 @@ def process_fold_input(
 
   if data_pipeline_config is None:
     print('Skipping data pipeline...')
+    pipeline_time = 0
   else:
     print('Running data pipeline...')
+    pipeline_start = time.time()
     fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+    pipeline_time = time.time() - pipeline_start
+    print(f'Data pipeline took {pipeline_time:.1f} seconds')
 
   write_fold_input_json(fold_input, output_dir)
   if model_runner is None:
     print('Skipping model inference...')
+    inference_time = 0
     output = fold_input
   else:
     print(
         f'Predicting 3D structure for {fold_input.name} with'
         f' {len(fold_input.rng_seeds)} seed(s)...'
     )
+    inference_start = time.time()
     all_inference_results = predict_structure(
         fold_input=fold_input,
         model_runner=model_runner,
         buckets=buckets,
         conformer_max_iterations=conformer_max_iterations,
     )
+    inference_time = time.time() - inference_start
+    print(f'Model inference took {inference_time:.1f} seconds')
+    
     print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+    write_start = time.time()
     write_outputs(
         all_inference_results=all_inference_results,
         output_dir=output_dir,
         job_name=fold_input.sanitised_name(),
     )
+    write_time = time.time() - write_start
+    print(f'Writing outputs took {write_time:.1f} seconds')
     output = all_inference_results
 
-  print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
-  return output
+  total_job_time = time.time() - job_start_time
+  print(f'Fold job {fold_input.name} completed in {total_job_time:.1f} seconds')
+  if data_pipeline_config is not None and model_runner is not None:
+    print(f'  - Data pipeline: {pipeline_time:.1f}s')
+    print(f'  - Model inference: {inference_time:.1f}s')
+    print(f'  - Output writing: {write_time:.1f}s')
+  print(f'Output written to {output_dir}\n')
+  
+  return output, total_job_time  # 返回处理结果和耗时
 
 
 def main(_):
@@ -668,34 +744,6 @@ def main(_):
   except OSError as e:
     print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
     raise
-
-  if _RUN_INFERENCE.value:
-    # Fail early on incompatible devices, but only if we're running inference.
-    gpu_devices = jax.local_devices(backend='gpu')
-    if gpu_devices:
-      compute_capability = float(
-          gpu_devices[_GPU_DEVICE.value].compute_capability
-      )
-      if compute_capability < 6.0:
-        raise ValueError(
-            'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-            ' https://developer.nvidia.com/cuda-gpus).'
-        )
-      elif 7.0 <= compute_capability < 8.0:
-        xla_flags = os.environ.get('XLA_FLAGS')
-        required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-        if not xla_flags or required_flag not in xla_flags:
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-              f' include "{required_flag}".'
-          )
-        if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the'
-              ' --flash_attention_implementation must be set to "xla".'
-          )
 
   notice = textwrap.wrap(
       'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
@@ -738,37 +786,37 @@ def main(_):
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
-    devices = jax.local_devices(backend='gpu')
-    print(
-        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-        f' {devices[_GPU_DEVICE.value]}'
-    )
+    # 使用CPU设备
+    devices = jax.local_devices(backend='cpu')
+    print(f'Using CPU device: {devices[0]}')
 
     print('Building model from scratch...')
     model_runner = ModelRunner(
         config=make_model_config(
-            flash_attention_implementation=typing.cast(
-                attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-            ),
+            flash_attention_implementation='xla',  # CPU只支持XLA实现
             num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
             num_recycles=_NUM_RECYCLES.value,
             return_embeddings=_SAVE_EMBEDDINGS.value,
         ),
-        device=devices[_GPU_DEVICE.value],
+        device=devices[0],  # 使用第一个CPU设备
         model_dir=pathlib.Path(MODEL_DIR.value),
     )
-    # Check we can load the model parameters before launching anything.
+    # 检查模型参数加载
     print('Checking that model parameters can be loaded...')
     _ = model_runner.model_params
   else:
     model_runner = None
 
   num_fold_inputs = 0
+  total_time = 0
+  job_times = []  # 存储每个任务的耗时
+  
   for fold_input in fold_inputs:
     if _NUM_SEEDS.value is not None:
       print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
       fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-    process_fold_input(
+    
+    result, job_time = process_fold_input(
         fold_input=fold_input,
         data_pipeline_config=data_pipeline_config,
         model_runner=model_runner,
@@ -776,9 +824,18 @@ def main(_):
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
         conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
     )
+    
+    job_times.append((fold_input.name, job_time))
+    total_time += job_time
     num_fold_inputs += 1
 
-  print(f'Done running {num_fold_inputs} fold jobs.')
+  # 打印总结报告
+  print('\n' + '='*50)
+  print(f'Completed {num_fold_inputs} fold jobs in {total_time:.1f} seconds')
+  print('\nPer-job timing breakdown:')
+  for job_name, job_time in job_times:
+    print(f'  - {job_name}: {job_time:.1f}s')
+  print('='*50 + '\n')
 
 
 if __name__ == '__main__':
