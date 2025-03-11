@@ -1,4 +1,3 @@
-```mermaid
 graph TD
     A[程序启动] -->|用户输入账号| B[用户登录 BiliFavGUI.login()]
     B -->|API 验证 Cookie| C[验证成功 Bili_fav.login()]
